@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Large pretrain corpora (regenerate with data/download.py)
+data/processed/mix_1to1.jsonl
+data/processed/mix_1to2.jsonl
+
+# Local / logs
+.claude/settings.local.json
+training/pretrain_log/
