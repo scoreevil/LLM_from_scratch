@@ -12,3 +12,4 @@ data/processed/mix_1to2.jsonl
 # Local / logs
 .claude/settings.local.json
 training/pretrain_log/
+training/checkpoints/

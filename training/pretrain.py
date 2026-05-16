@@ -20,6 +20,8 @@ Pipeline:
         Device auto: cuda if available else cpu.
         Every --eval-every steps: flip to eval(), score N fixed val batches,
         log {step, train_loss, val_loss, ppl} to JSONL, flip back to train().
+        Checkpoints (``--train`` only) go to training/checkpoints/pretrain/:
+        last.pt on every eval, best.pt when val_loss improves.
 
 Logging:
     train_log.txt is JSONL — one row per eval point. Easy to read with
@@ -54,6 +56,9 @@ from model import MiniLLM  # noqa: E402
 # vocab. NULL never appears in valid UTF-8 text, so it is a clean boundary
 # marker without overloading a meaningful token.
 SEP_TOKEN_ID = 0
+
+# Real pretrain checkpoints (model + optimizer + hyperparams for resume).
+CKPT_DIR = Path(__file__).resolve().parent / "checkpoints" / "pretrain"
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +187,31 @@ def prepare_val_batches(
     return batches
 
 
+def save_checkpoint(
+    path: Path,
+    *,
+    step: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    val_loss: float,
+    train_loss: float,
+    model_config: dict,
+) -> None:
+    """Write a resumable checkpoint (weights, optimizer, step, model_config)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": val_loss,
+            "train_loss": train_loss,
+            "model_config": model_config,
+        },
+        path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -197,10 +227,14 @@ def train_loop(
     log_path: Path,
     device: torch.device,
     print_every: int = 10,
+    model_config: Optional[dict] = None,
 ) -> None:
     """Run training for ``max_steps`` steps with periodic eval & JSONL logging."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_f = log_path.open("a", encoding="utf-8")
+
+    save_ckpt = model_config is not None
+    best_val_loss = float("inf")
 
     model.train()
     step = 0
@@ -250,6 +284,34 @@ def train_loop(
                     f"  >> eval @ step {step}: val_loss={vloss:.4f}  PPL={ppl:.3f}",
                     flush=True,
                 )
+
+                if save_ckpt:
+                    save_checkpoint(
+                        CKPT_DIR / "last.pt",
+                        step=step,
+                        model=model,
+                        optimizer=optimizer,
+                        val_loss=vloss,
+                        train_loss=last_train_loss,
+                        model_config=model_config,
+                    )
+                    if vloss < best_val_loss:
+                        best_val_loss = vloss
+                        save_checkpoint(
+                            CKPT_DIR / "best.pt",
+                            step=step,
+                            model=model,
+                            optimizer=optimizer,
+                            val_loss=vloss,
+                            train_loss=last_train_loss,
+                            model_config=model_config,
+                        )
+                        print(
+                            f"  >> saved best.pt (val_loss={vloss:.4f}) -> {CKPT_DIR}",
+                            flush=True,
+                        )
+                    else:
+                        print(f"  >> saved last.pt -> {CKPT_DIR}", flush=True)
     finally:
         log_f.close()
 
@@ -414,6 +476,18 @@ def _pretrain(args: argparse.Namespace) -> None:
 
     log_path = Path(args.log_path)
     print(f"[train] log -> {log_path}", flush=True)
+    print(f"[train] checkpoints -> {CKPT_DIR}", flush=True)
+
+    model_config = {
+        "vocab_size": vocab_size,
+        "d_model": args.d_model,
+        "n_layer": args.n_layer,
+        "n_heads": args.n_heads,
+        "max_seq_len": args.seq_len,
+        "ffn_mult": 4,
+        "bias": True,
+        "tie_weights": True,
+    }
 
     train_loop(
         model=model,
@@ -426,9 +500,10 @@ def _pretrain(args: argparse.Namespace) -> None:
         log_path=log_path,
         device=device,
         print_every=args.print_every,
+        model_config=model_config,
     )
 
-    print("[train] done.", flush=True)
+    print(f"[train] done. last.pt / best.pt under {CKPT_DIR}", flush=True)
 
 
 # ---------------------------------------------------------------------------
