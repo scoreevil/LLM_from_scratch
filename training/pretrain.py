@@ -23,6 +23,10 @@ Pipeline:
         Checkpoints (``--train`` only) go to training/checkpoints/pretrain/:
         last.pt on every eval, best.pt when val_loss improves.
 
+    ``--epochs`` (default 3) replays the full train JSONL that many times.
+    ``--steps 0`` means no global step cap; set ``--steps N`` to stop early.
+    Before training, one pass counts batches/epoch so logs can show data x%.
+
 Logging:
     train_log.txt is JSONL — one row per eval point. Easy to read with
     pandas.read_json(path, lines=True) for plotting later.
@@ -36,12 +40,13 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Tuple
+from typing import Callable, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, IterableDataset
+from tqdm import tqdm
 
 # Allow `from model import ...` / `from tokenizer import ...` when invoked as
 # a script from the project root.
@@ -163,6 +168,30 @@ def eval_loss(model: nn.Module, batches: List[Tuple[torch.Tensor, torch.Tensor]]
     return total / max(1, n)
 
 
+def build_train_loader(
+    files: List[Path],
+    tokenizer,
+    seq_len: int,
+    batch_size: int,
+) -> DataLoader:
+    ds = PackedJSONLDataset(files, tokenizer=tokenizer, seq_len=seq_len)
+    return DataLoader(ds, batch_size=batch_size, num_workers=0)
+
+
+def count_batches_per_epoch(
+    files: List[Path],
+    tokenizer,
+    seq_len: int,
+    batch_size: int,
+) -> int:
+    """One full tokenize+pack pass to count training batches in a single epoch."""
+    loader = build_train_loader(files, tokenizer, seq_len, batch_size)
+    n = 0
+    for _ in tqdm(loader, desc="count-batches/epoch", unit="batch"):
+        n += 1
+    return max(1, n)
+
+
 def prepare_val_batches(
     file: Path,
     tokenizer,
@@ -191,6 +220,7 @@ def save_checkpoint(
     path: Path,
     *,
     step: int,
+    epoch: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     val_loss: float,
@@ -202,6 +232,7 @@ def save_checkpoint(
     torch.save(
         {
             "step": step,
+            "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_loss": val_loss,
@@ -212,15 +243,29 @@ def save_checkpoint(
     )
 
 
+def _epoch_data_pct(epoch_batches: int, batches_per_epoch: int) -> float:
+    return min(100.0, 100.0 * epoch_batches / max(1, batches_per_epoch))
+
+
+def _progress_suffix(epoch: int, epochs: int, epoch_batches: int, batches_per_epoch: int) -> str:
+    pct = _epoch_data_pct(epoch_batches, batches_per_epoch)
+    return (
+        f"epoch {epoch}/{epochs}  "
+        f"data {epoch_batches}/{batches_per_epoch} ({pct:.1f}%)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 def train_loop(
     model: nn.Module,
-    train_iter: Iterator[Tuple[torch.Tensor, torch.Tensor]],
+    new_train_iter: Callable[[], Iterator[Tuple[torch.Tensor, torch.Tensor]]],
     val_batches: List[Tuple[torch.Tensor, torch.Tensor]],
     optimizer: torch.optim.Optimizer,
     *,
+    epochs: int,
+    batches_per_epoch: int,
     max_steps: int,
     eval_every: int,
     grad_clip: float,
@@ -228,90 +273,136 @@ def train_loop(
     device: torch.device,
     print_every: int = 10,
     model_config: Optional[dict] = None,
+    ckpt_dir: Optional[Path] = None,
 ) -> None:
-    """Run training for ``max_steps`` steps with periodic eval & JSONL logging."""
+    """Train for ``epochs`` full passes; optional global cap ``max_steps`` (0 = none)."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_f = log_path.open("a", encoding="utf-8")
 
+    ckpt_dir = Path(ckpt_dir) if ckpt_dir is not None else CKPT_DIR
     save_ckpt = model_config is not None
     best_val_loss = float("inf")
+    unlimited_steps = max_steps <= 0
 
     model.train()
     step = 0
     started = time.time()
     last_train_loss = float("nan")
+    stop_training = False
 
     try:
-        while step < max_steps:
-            try:
-                x, y = next(train_iter)
-            except StopIteration:
-                print(f"[info] train iterator exhausted at step {step}")
+        for epoch in range(1, epochs + 1):
+            if stop_training:
                 break
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+            epoch_batches = 0
+            train_iter = new_train_iter()
+            print(
+                f"\n[epoch {epoch}/{epochs}] start  "
+                f"({batches_per_epoch} batches/epoch)",
+                flush=True,
+            )
 
-            loss = compute_loss(model, x, y)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-            optimizer.step()
+            while True:
+                if not unlimited_steps and step >= max_steps:
+                    print(f"[info] reached --steps {max_steps}", flush=True)
+                    stop_training = True
+                    break
 
-            last_train_loss = loss.item()
-            step += 1
-
-            if step % print_every == 0:
-                tok_per_s = step * x.size(0) * x.size(1) / max(1e-9, time.time() - started)
-                print(
-                    f"step {step:>6d}  train_loss={last_train_loss:.4f}  "
-                    f"tok/s={tok_per_s:,.0f}",
-                    flush=True,
-                )
-
-            if step % eval_every == 0 or step == max_steps:
-                vloss = eval_loss(model, val_batches)
-                ppl = math.exp(min(vloss, 50.0))  # cap to avoid inf for early steps
-                row = {
-                    "step": step,
-                    "train_loss": last_train_loss,
-                    "val_loss": vloss,
-                    "ppl": ppl,
-                    "wallclock_s": round(time.time() - started, 2),
-                }
-                log_f.write(json.dumps(row) + "\n")
-                log_f.flush()
-                print(
-                    f"  >> eval @ step {step}: val_loss={vloss:.4f}  PPL={ppl:.3f}",
-                    flush=True,
-                )
-
-                if save_ckpt:
-                    save_checkpoint(
-                        CKPT_DIR / "last.pt",
-                        step=step,
-                        model=model,
-                        optimizer=optimizer,
-                        val_loss=vloss,
-                        train_loss=last_train_loss,
-                        model_config=model_config,
+                try:
+                    x, y = next(train_iter)
+                except StopIteration:
+                    pct = _epoch_data_pct(epoch_batches, batches_per_epoch)
+                    print(
+                        f"[epoch {epoch}/{epochs}] complete  "
+                        f"data {epoch_batches}/{batches_per_epoch} ({pct:.1f}%)",
+                        flush=True,
                     )
-                    if vloss < best_val_loss:
-                        best_val_loss = vloss
+                    break
+
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+
+                loss = compute_loss(model, x, y)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                optimizer.step()
+
+                last_train_loss = loss.item()
+                step += 1
+                epoch_batches += 1
+                prog = _progress_suffix(epoch, epochs, epoch_batches, batches_per_epoch)
+
+                if step % print_every == 0:
+                    tok_per_s = step * x.size(0) * x.size(1) / max(1e-9, time.time() - started)
+                    print(
+                        f"step {step:>6d}  {prog}  "
+                        f"train_loss={last_train_loss:.4f}  tok/s={tok_per_s:,.0f}",
+                        flush=True,
+                    )
+
+                do_eval = step % eval_every == 0
+                if do_eval:
+                    vloss = eval_loss(model, val_batches)
+                    ppl = math.exp(min(vloss, 50.0))
+                    row = {
+                        "step": step,
+                        "epoch": epoch,
+                        "epochs": epochs,
+                        "epoch_batches": epoch_batches,
+                        "batches_per_epoch": batches_per_epoch,
+                        "epoch_data_pct": round(
+                            _epoch_data_pct(epoch_batches, batches_per_epoch), 2
+                        ),
+                        "train_loss": last_train_loss,
+                        "val_loss": vloss,
+                        "ppl": ppl,
+                        "wallclock_s": round(time.time() - started, 2),
+                    }
+                    log_f.write(json.dumps(row) + "\n")
+                    log_f.flush()
+                    print(
+                        f"  >> eval @ step {step}  {prog}  "
+                        f"val_loss={vloss:.4f}  PPL={ppl:.3f}",
+                        flush=True,
+                    )
+
+                    if save_ckpt:
                         save_checkpoint(
-                            CKPT_DIR / "best.pt",
+                            ckpt_dir / "last.pt",
                             step=step,
+                            epoch=epoch,
                             model=model,
                             optimizer=optimizer,
                             val_loss=vloss,
                             train_loss=last_train_loss,
                             model_config=model_config,
                         )
-                        print(
-                            f"  >> saved best.pt (val_loss={vloss:.4f}) -> {CKPT_DIR}",
-                            flush=True,
-                        )
-                    else:
-                        print(f"  >> saved last.pt -> {CKPT_DIR}", flush=True)
+                        if vloss < best_val_loss:
+                            best_val_loss = vloss
+                            save_checkpoint(
+                                ckpt_dir / "best.pt",
+                                step=step,
+                                epoch=epoch,
+                                model=model,
+                                optimizer=optimizer,
+                                val_loss=vloss,
+                                train_loss=last_train_loss,
+                                model_config=model_config,
+                            )
+                            print(
+                                f"  >> saved best.pt (val_loss={vloss:.4f}) -> {ckpt_dir}",
+                                flush=True,
+                            )
+                        else:
+                            print(f"  >> saved last.pt -> {ckpt_dir}", flush=True)
+
+            if epoch_batches < batches_per_epoch:
+                print(
+                    f"[warn] epoch {epoch} ended early: "
+                    f"{epoch_batches} < {batches_per_epoch} batches",
+                    flush=True,
+                )
     finally:
         log_f.close()
 
@@ -465,18 +556,29 @@ def _pretrain(args: argparse.Namespace) -> None:
     print(f"[train] got {len(val_batches)} val batches "
           f"({args.batch_size}x{args.seq_len} each)", flush=True)
 
-    # Train iterator (streaming, packed).
-    train_ds = PackedJSONLDataset(
-        files=[Path(f) for f in args.train_files],
-        tokenizer=tok,
-        seq_len=args.seq_len,
+    train_files = [Path(f) for f in args.train_files]
+    print("[train] counting batches per epoch (full tokenize pass)...", flush=True)
+    batches_per_epoch = count_batches_per_epoch(
+        train_files, tok, args.seq_len, args.batch_size
     )
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=0)
-    train_iter = iter(train_loader)
+    tokens_per_epoch = batches_per_epoch * args.batch_size * args.seq_len
+    print(
+        f"[train] {batches_per_epoch:,} batches/epoch  "
+        f"(~{tokens_per_epoch/1e6:.1f}M tokens/epoch)",
+        flush=True,
+    )
+    if args.steps > 0:
+        print(f"[train] global step cap: {args.steps:,}", flush=True)
+    else:
+        print(f"[train] epochs={args.epochs} (no --steps cap)", flush=True)
+
+    def new_train_iter() -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        return iter(build_train_loader(train_files, tok, args.seq_len, args.batch_size))
 
     log_path = Path(args.log_path)
+    ckpt_dir = Path(args.ckpt_dir)
     print(f"[train] log -> {log_path}", flush=True)
-    print(f"[train] checkpoints -> {CKPT_DIR}", flush=True)
+    print(f"[train] checkpoints -> {ckpt_dir}", flush=True)
 
     model_config = {
         "vocab_size": vocab_size,
@@ -491,9 +593,11 @@ def _pretrain(args: argparse.Namespace) -> None:
 
     train_loop(
         model=model,
-        train_iter=train_iter,
+        new_train_iter=new_train_iter,
         val_batches=val_batches,
         optimizer=optimizer,
+        epochs=args.epochs,
+        batches_per_epoch=batches_per_epoch,
         max_steps=args.steps,
         eval_every=args.eval_every,
         grad_clip=args.clip,
@@ -501,9 +605,10 @@ def _pretrain(args: argparse.Namespace) -> None:
         device=device,
         print_every=args.print_every,
         model_config=model_config,
+        ckpt_dir=ckpt_dir,
     )
 
-    print(f"[train] done. last.pt / best.pt under {CKPT_DIR}", flush=True)
+    print(f"[train] done. last.pt / best.pt under {ckpt_dir}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -528,13 +633,29 @@ def main() -> None:
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--steps", type=int, default=1000)
+    ap.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help="Full passes over --train-files (default 3).",
+    )
+    ap.add_argument(
+        "--steps",
+        type=int,
+        default=0,
+        help="Global optimizer-step cap (0 = train all epochs).",
+    )
     ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--val-batches", type=int, default=8)
     ap.add_argument("--print-every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
     # Logging
     ap.add_argument("--log-path", default="training/train_log.txt")
+    ap.add_argument(
+        "--ckpt-dir",
+        default=str(CKPT_DIR),
+        help="Directory for last.pt / best.pt (use a unique path per experiment).",
+    )
     args = ap.parse_args()
 
     if args.train:
