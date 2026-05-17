@@ -53,6 +53,12 @@ from tokenizer import BBPETokenizer  # noqa: E402
 PAD_ID = 0
 
 
+def _resolve_tokenizer_dir(tokenizer: str | None, tokenizer_size: str) -> Path:
+    if tokenizer:
+        return Path(tokenizer)
+    return Path("tokenizer") / tokenizer_size
+
+
 # ---------------------------------------------------------------------------
 # Prompt building
 # ---------------------------------------------------------------------------
@@ -324,7 +330,16 @@ def main() -> None:
     ap.add_argument("--mmlu", type=Path, default=Path("data/eval/mmlu_subset.jsonl"))
     ap.add_argument("--cmmlu", type=Path, default=Path("data/eval/cmmlu_subset.jsonl"))
     ap.add_argument("--translation", type=Path, default=Path("data/eval/translation_pairs.jsonl"))
-    ap.add_argument("--tokenizer", default="tokenizer")
+    ap.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer directory path. If omitted, uses tokenizer/<--tokenizer-size>.",
+    )
+    ap.add_argument(
+        "--tokenizer-size",
+        default="8k",
+        help="Tokenizer variant under tokenizer/. e.g. 8k, 32k",
+    )
     ap.add_argument("--max-items", type=int, default=None,
                     help="Cap items per task for a quick smoke. Default: use all.")
     ap.add_argument("--n-heads", type=int, default=4,
@@ -339,7 +354,9 @@ def main() -> None:
     )
     print(f"[eval] device = {device}", flush=True)
 
-    tok = BBPETokenizer.load(args.tokenizer)
+    tokenizer_dir = _resolve_tokenizer_dir(args.tokenizer, args.tokenizer_size)
+    tok = BBPETokenizer.load(tokenizer_dir)
+    print(f"[eval] tokenizer dir = {tokenizer_dir}", flush=True)
     print(f"[eval] tokenizer vocab = {tok.vocab_size}", flush=True)
 
     ckpts = discover_checkpoints(args.checkpoints_root, args.ckpt_name)

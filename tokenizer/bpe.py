@@ -416,8 +416,19 @@ def main() -> None:
     )
     ap.add_argument("--vocab-size", type=int, default=8192)
     ap.add_argument("--max-samples", type=int, default=50_000)
-    ap.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent)
+    ap.add_argument(
+        "--tokenizer-size",
+        default="8k",
+        help="Tokenizer variant directory under tokenizer/. e.g. 8k, 32k",
+    )
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Output directory. If omitted, uses tokenizer/<--tokenizer-size>.",
+    )
     args = ap.parse_args()
+    out_dir = args.out_dir or (Path(__file__).resolve().parent / args.tokenizer_size)
 
     if args.train:
         if not args.data.exists():
@@ -430,10 +441,10 @@ def main() -> None:
         )
         tok = BBPETokenizer()
         tok.train(_iter_jsonl(args.data, args.max_samples), vocab_size=args.vocab_size)
-        tok.save(args.out_dir)
-        print(f"[train] saved vocab.json + merges.txt -> {args.out_dir}")
+        tok.save(out_dir)
+        print(f"[train] saved vocab.json + merges.txt -> {out_dir}")
         # 对落盘文件再加载一次，做短句编解码自检。
-        tok2 = BBPETokenizer.load(args.out_dir)
+        tok2 = BBPETokenizer.load(out_dir)
         sample = "你好 World 👩‍💻"
         ids = tok2.encode(sample)
         assert tok2.decode(ids, errors="strict") == sample

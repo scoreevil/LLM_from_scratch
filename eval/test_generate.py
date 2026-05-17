@@ -26,6 +26,7 @@ def main() -> int:
     out_dir = Path(os.getenv("OUT_DIR", str(root / "eval" / "generation_tests")))
     max_new_tokens = int(os.getenv("MAX_NEW_TOKENS", "80"))
     timeout_s = int(os.getenv("TIMEOUT_S", "180"))
+    tokenizer_size = os.getenv("TOKENIZER_SIZE", "32k")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,6 +99,8 @@ def main() -> int:
                 str(case["top_p"]),
                 "--n-heads",
                 str(n_heads),
+                "--tokenizer-size",
+                tokenizer_size,
             ]
             try:
                 proc = subprocess.run(
@@ -128,6 +131,7 @@ def main() -> int:
         f.write("# Generation comparison by group\n\n")
         f.write(f"- max_new_tokens: `{max_new_tokens}`\n")
         f.write(f"- timeout per run: `{timeout_s}s`\n")
+        f.write(f"- tokenizer_size: `{tokenizer_size}`\n")
         f.write("- n_heads mapping: `PT-1A=12`, `PT-1B=12`, `PT-2A=8`, `PT-2B=16`\n")
         f.write("- available groups: " + ", ".join(f"`{k}`" for k in available_groups) + "\n")
         if missing_groups:

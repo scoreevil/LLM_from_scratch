@@ -111,8 +111,17 @@ def report_file(fname: str, sample_stats: dict, full_stats: dict, heur_total: in
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tokenizer-dir", type=Path,
-                    default=Path(__file__).resolve().parent)
+    ap.add_argument(
+        "--tokenizer-dir",
+        type=Path,
+        default=None,
+        help="Tokenizer directory path. If omitted, uses tokenizer/<--tokenizer-size>.",
+    )
+    ap.add_argument(
+        "--tokenizer-size",
+        default="8k",
+        help="Tokenizer variant under tokenizer/. e.g. 8k, 32k",
+    )
     ap.add_argument("--data-dir", type=Path,
                     default=Path(__file__).resolve().parent.parent / "data" / "processed")
     ap.add_argument("--samples-per-lang", type=int, default=2000,
@@ -125,8 +134,9 @@ def main():
                     help="Skip the full-file char scan (faster, but no file-level projection).")
     args = ap.parse_args()
 
-    tok = BBPETokenizer.load(args.tokenizer_dir)
-    print(f"Loaded tokenizer from {args.tokenizer_dir}  (vocab={tok.vocab_size})")
+    tokenizer_dir = args.tokenizer_dir or (Path(__file__).resolve().parent / args.tokenizer_size)
+    tok = BBPETokenizer.load(tokenizer_dir)
+    print(f"Loaded tokenizer from {tokenizer_dir}  (vocab={tok.vocab_size})")
 
     for fname in args.files:
         fpath = args.data_dir / fname

@@ -25,6 +25,18 @@ from model import MiniLLM, PastKeyValues  # noqa: E402
 from tokenizer import BBPETokenizer  # noqa: E402
 
 
+def _resolve_tokenizer_dir(tokenizer: str | None, tokenizer_size: str) -> Path:
+    """Resolve tokenizer directory.
+
+    Priority:
+      1) explicit --tokenizer path
+      2) tokenizer/<tokenizer_size> (default: tokenizer/8k)
+    """
+    if tokenizer:
+        return Path(tokenizer)
+    return Path("tokenizer") / tokenizer_size
+
+
 def _safe_torch_load(path: Path, map_location: torch.device):
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
@@ -244,7 +256,16 @@ def _repl(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", type=Path, required=True)
-    ap.add_argument("--tokenizer", default="tokenizer")
+    ap.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer directory path. If omitted, uses tokenizer/<--tokenizer-size>.",
+    )
+    ap.add_argument(
+        "--tokenizer-size",
+        default="8k",
+        help="Tokenizer variant under tokenizer/. e.g. 8k, 32k",
+    )
     ap.add_argument("--prompt", default=None)
     ap.add_argument("--max-new-tokens", type=int, default=80)
     ap.add_argument("--temperature", type=float, default=0.8)
@@ -264,7 +285,9 @@ def main() -> None:
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
-    tok = BBPETokenizer.load(args.tokenizer)
+    tokenizer_dir = _resolve_tokenizer_dir(args.tokenizer, args.tokenizer_size)
+    tok = BBPETokenizer.load(tokenizer_dir)
+    print(f"[load] tokenizer_dir={tokenizer_dir}", flush=True)
     model, cfg = load_checkpoint(
         args.checkpoint,
         n_heads=args.n_heads,

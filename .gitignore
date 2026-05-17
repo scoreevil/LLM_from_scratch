@@ -8,6 +8,7 @@ venv/
 # Large pretrain corpora (regenerate with data/download.py)
 data/processed/mix_1to1.jsonl
 data/processed/mix_1to2.jsonl
+data/processed/mix_1to1_3B.jsonl
 
 # Local / logs
 .claude/settings.local.json

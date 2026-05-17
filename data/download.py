@@ -185,8 +185,8 @@ def main() -> None:
     total = 200_000 if args.smoke else args.total_tokens
 
     specs = [
-        SubsetSpec(name="mix_1to1", zh_ratio=0.5,       total_tokens=total),
-        SubsetSpec(name="mix_1to2", zh_ratio=1.0 / 3.0, total_tokens=total),
+        SubsetSpec(name="mix_1to1_3B", zh_ratio=0.5, total_tokens=total),
+        # SubsetSpec(name="mix_1to2", zh_ratio=1.0 / 3.0, total_tokens=total),  # PT-3 不需要
     ]
 
     print(f"[info] target tokens/subset = {total:,}  out_dir={args.out_dir}")

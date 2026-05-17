@@ -71,6 +71,12 @@ SEP_TOKEN_ID = 0
 CKPT_DIR = Path(__file__).resolve().parent / "checkpoints" / "pretrain"
 
 
+def _resolve_tokenizer_dir(tokenizer: str | None, tokenizer_size: str) -> Path:
+    if tokenizer:
+        return Path(tokenizer)
+    return Path("tokenizer") / tokenizer_size
+
+
 # ---------------------------------------------------------------------------
 # Datasets
 # ---------------------------------------------------------------------------
@@ -671,8 +677,9 @@ def _pretrain(args: argparse.Namespace) -> None:
     from tokenizer import BBPETokenizer
 
     print(f"[train] device = {device}", flush=True)
-    print(f"[train] loading tokenizer from {args.tokenizer}", flush=True)
-    tok = BBPETokenizer.load(args.tokenizer)
+    tokenizer_dir = _resolve_tokenizer_dir(args.tokenizer, args.tokenizer_size)
+    print(f"[train] loading tokenizer from {tokenizer_dir}", flush=True)
+    tok = BBPETokenizer.load(tokenizer_dir)
     vocab_size = tok.vocab_size
     print(f"[train] vocab_size = {vocab_size}", flush=True)
 
@@ -825,7 +832,16 @@ def main() -> None:
     ap.add_argument("--train-files", nargs="+",
                     default=["data/processed/mix_1to1.jsonl"])
     ap.add_argument("--val-file", default="data/processed/val_set.jsonl")
-    ap.add_argument("--tokenizer", default="tokenizer")
+    ap.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer directory path. If omitted, uses tokenizer/<--tokenizer-size>.",
+    )
+    ap.add_argument(
+        "--tokenizer-size",
+        default="8k",
+        help="Tokenizer variant under tokenizer/. e.g. 8k, 32k",
+    )
     ap.add_argument(
         "--batches-per-epoch",
         type=int,
