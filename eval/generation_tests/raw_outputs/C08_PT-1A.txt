@@ -1,0 +1,2 @@
+[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
+Python function to compute fibonacci numbers: 1) 0.01 0.02 0.03 0.04 0.06 0.06 0.06 0.07 0.06 0.06 0.06 0.06 0.06 0.07 0.07 0.

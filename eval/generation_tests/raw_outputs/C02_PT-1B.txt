@@ -1,0 +1,2 @@
+[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
+Write a short paragraph about machine learning. The answer is "this is why we are developing machine learning to use machine learning to do so." It's also used to describe how machine learning is a new way of processing. The simplified answer is "this is why we are developing machine learning. We are developing machine learning to do so." It's a little like the "expertise" model, but the "

@@ -1,0 +1,2 @@
+[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
+Translate to Chinese: The weather is nice today. But it’s not as good as it is for the people. In the last few years, the Chinese have seen a dramatic increase in the number of people who are living in the world. So why aren’t we just the people that are in the world? The answer is yes. The people that are living in the world aren’t the people that are living in the world.

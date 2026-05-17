@@ -1,0 +1,4 @@
+[load] resolved config: vocab=8192 d_model=512 n_layer=6 n_heads=8 max_seq_len=512
+Continue the story: On the edge of the galaxy, it shows the moment you reach in to your mind.
+When you reach the galaxy you are stuck as soon as you are sitting down to finish this galaxy. You strive a little onto paper but it was really one of the spinsters.
+But you should never throw finger closer to it. I would also nim and

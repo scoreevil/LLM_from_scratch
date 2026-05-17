@@ -1,0 +1,2 @@
+[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
+List 5 common sorting algorithms: Python, Java, Spin are 2x possible; a finger has three classes. Simple one. One. One. a. a. an Awesome (moderate) method (see above) that gives it the ability to identify the basic input of the program. One. Awesome (moderate) method.

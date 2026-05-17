@@ -1,0 +1,2 @@
+[load] resolved config: vocab=8192 d_model=512 n_layer=6 n_heads=8 max_seq_len=512
+Translate to Chinese: The weather is nice today. The weather is not always the same, but it is not always the same. If you’re a pianist, you’re a pianist. The weather is a pianist, but it’s not the same as the weather. It’s the same thing. It’s the same thing. You’re not the same. It’s the same thing. If you’re a pianist

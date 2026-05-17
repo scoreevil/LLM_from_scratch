@@ -1,0 +1,3 @@
+[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
+In one sentence, explain overfitting. It is okay with overfitting, but it is okay with overfitting. Be sure to rely on others, but it does not involve a way of getting into the problem. It is okay with overfitting.
+Rapid Fitting: the benefit of having overfitting is that it’s good, but it’s always

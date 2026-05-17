@@ -1,0 +1,2 @@
+[load] resolved config: vocab=8192 d_model=512 n_layer=6 n_heads=8 max_seq_len=512
+In one sentence, explain overfitting. Similarly, explain asks that these parameters would also be essential in understanding what the cause of the fistening. For example, describe our current situation, explain that the fistening of the velocity of all fistening events. If this leads to the Fistening Affect, then explain the differences between fistening events and their reaction patterns and

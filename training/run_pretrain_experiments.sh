@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Four pretrain runs (3 full epochs each). Run from repo root.
 #
-# Batch sizes tuned for A800 + seq_len=512 (~6万–13万 tokens/step).
-#   PT-1A/1B: 256×512 ≈ 131k tok/step  (~2.3k steps/epoch on ~150M-tok mix)
-#   PT-2A:    512×512 ≈ 262k tok/step  (40M params; smallest model)
-#   PT-2B:    128×512 ≈  66k tok/step  (1024-wide; conservative vs OOM)
+# batch_size: any positive integer (224, 200, … all OK; not limited to powers of 2).
+# Tuned for A800 + seq_len=512 + bf16 AMP. Slightly under 256/512 to avoid OOM headroom.
+#   PT-1A/1B: 224×512 ≈ 114k tok/step
+#   PT-2A:    448×512 ≈ 229k tok/step
+#   PT-2B:    112×512 ≈  57k tok/step
 #
-# OOM? Halve --batch-size for that run only.
+# Still OOM? Drop 1A/1B to 200 or 192; 2A to 384; 2B to 96.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -15,7 +16,7 @@ cd "$(dirname "$0")/.."
 python training/pretrain.py --train \
   --train-files data/processed/mix_1to1.jsonl \
   --d-model 768 --n-layer 12 --n-heads 12 \
-  --batch-size 256 \
+  --batch-size 224 \
   --epochs 3 \
   --eval-every 500 \
   --log-path training/pretrain_log/train_log_PT-1A.txt \
@@ -25,7 +26,7 @@ python training/pretrain.py --train \
 python training/pretrain.py --train \
   --train-files data/processed/mix_1to2.jsonl \
   --d-model 768 --n-layer 12 --n-heads 12 \
-  --batch-size 256 \
+  --batch-size 224 \
   --epochs 3 \
   --eval-every 500 \
   --log-path training/pretrain_log/train_log_PT-1B.txt \
@@ -35,7 +36,7 @@ python training/pretrain.py --train \
 python training/pretrain.py --train \
   --train-files data/processed/mix_1to1.jsonl \
   --d-model 512 --n-layer 6 --n-heads 8 \
-  --batch-size 512 \
+  --batch-size 448 \
   --epochs 3 \
   --eval-every 500 \
   --log-path training/pretrain_log/train_log_PT-2A.txt \
@@ -45,7 +46,7 @@ python training/pretrain.py --train \
 python training/pretrain.py --train \
   --train-files data/processed/mix_1to1.jsonl \
   --d-model 1024 --n-layer 8 --n-heads 16 \
-  --batch-size 128 \
+  --batch-size 112 \
   --epochs 3 \
   --eval-every 500 \
   --log-path training/pretrain_log/train_log_PT-2B.txt \

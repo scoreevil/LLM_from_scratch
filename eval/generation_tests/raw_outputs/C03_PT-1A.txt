@@ -1,0 +1,2 @@
+[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
+In one sentence, explain overfitting. Of course, that I cannot see why the actual word was being used in Broding Limited (“you think I do it…”). The person doing this is not like the actual word but rather how much the word really is. In actual fact, that is the first sentence I can notice. It is simply the second sentence that makes a meaning of some

@@ -18,6 +18,7 @@ Pipeline:
     Loop:
         AdamW(betas=(0.9, 0.95)) + cross_entropy + clip_grad_norm_(1.0).
         Device auto: cuda if available else cpu.
+        CUDA bf16 autocast by default (``--no-bf16`` to disable); no GradScaler.
         Every --eval-every steps: flip to eval(), score N fixed val batches,
         log {step, train_loss, val_loss, ppl} to JSONL, flip back to train().
         Checkpoints (``--train`` only) go to training/checkpoints/pretrain/:
@@ -25,7 +26,9 @@ Pipeline:
 
     ``--epochs`` (default 3) replays the full train JSONL that many times.
     ``--steps 0`` means no global step cap; set ``--steps N`` to stop early.
-    Before training, one pass counts batches/epoch so logs can show data x%.
+    Before training, batches/epoch is estimated via a fast char scan (default)
+    so training can start immediately; use ``--count-batches-exact`` for a full
+    tokenize pass or ``--batches-per-epoch N`` to pin the denominator.
 
 Logging:
     train_log.txt is JSONL — one row per eval point. Easy to read with
@@ -35,12 +38,14 @@ Logging:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -146,21 +151,54 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def compute_loss(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def resolve_bf16_amp(device: torch.device, *, enabled: bool) -> Optional[torch.dtype]:
+    """Return ``torch.bfloat16`` for CUDA autocast when supported, else ``None``."""
+    if not enabled or device.type != "cuda":
+        return None
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    print("[warn] --bf16 requested but GPU lacks bf16; training in fp32", flush=True)
+    return None
+
+
+@contextlib.contextmanager
+def amp_autocast(device: torch.device, amp_dtype: Optional[torch.dtype]):
+    if amp_dtype is None:
+        yield
+    else:
+        with torch.autocast(device_type=device.type, dtype=amp_dtype):
+            yield
+
+
+def compute_loss(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    amp_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
     """Standard next-token CE: flatten over batch and time."""
-    logits, _ = model(x)                               # [B, T, V]
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+    with amp_autocast(x.device, amp_dtype):
+        logits, _ = model(x)                           # [B, T, V]
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), y.reshape(-1)
+        )
 
 
 @torch.no_grad()
-def eval_loss(model: nn.Module, batches: List[Tuple[torch.Tensor, torch.Tensor]]) -> float:
+def eval_loss(
+    model: nn.Module,
+    batches: List[Tuple[torch.Tensor, torch.Tensor]],
+    *,
+    amp_dtype: Optional[torch.dtype] = None,
+) -> float:
     """Mean CE loss over a fixed list of pre-loaded batches. Toggles eval()/train()."""
     was_training = model.training
     model.eval()
     total = 0.0
     n = 0
     for x, y in batches:
-        loss = compute_loss(model, x, y)
+        loss = compute_loss(model, x, y, amp_dtype=amp_dtype)
         total += loss.item()
         n += 1
     if was_training:
@@ -176,6 +214,122 @@ def build_train_loader(
 ) -> DataLoader:
     ds = PackedJSONLDataset(files, tokenizer=tokenizer, seq_len=seq_len)
     return DataLoader(ds, batch_size=batch_size, num_workers=0)
+
+
+# Measured chars/token on mix JSONL (tokenizer/eval_token_ratio.py backtest).
+_CHARS_PER_TOKEN_DEFAULT = {"zh": 1.254, "en": 3.559}
+
+
+def packed_batches_from_stream(
+    total_tokens: int,
+    num_docs: int,
+    seq_len: int,
+    batch_size: int,
+) -> int:
+    """Match ``PackedJSONLDataset`` packing: one SEP per doc, then fixed blocks."""
+    block = seq_len + 1
+    stream = total_tokens + num_docs
+    n_seqs = stream // block
+    return max(1, (n_seqs + batch_size - 1) // batch_size)
+
+
+def scan_jsonl_chars(files: List[Path]) -> Dict[str, Dict[str, int]]:
+    """One UTF-8 pass per file: per-language char and doc totals (no tokenize)."""
+    totals: Dict[str, Dict[str, int]] = defaultdict(lambda: {"chars": 0, "docs": 0})
+    for path in files:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                lang = rec.get("lang")
+                text = rec.get("text") or ""
+                if not lang or not text:
+                    continue
+                totals[lang]["chars"] += len(text)
+                totals[lang]["docs"] += 1
+    return dict(totals)
+
+
+def sample_chars_per_token(
+    files: List[Path],
+    tokenizer,
+    per_lang: int,
+) -> Dict[str, float]:
+    """Encode up to ``per_lang`` docs per language; return chars/token ratios."""
+    stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"chars": 0, "tokens": 0, "docs": 0})
+    target_langs = tuple(_CHARS_PER_TOKEN_DEFAULT)
+    for path in files:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if all(stats[lg]["docs"] >= per_lang for lg in target_langs):
+                    return {
+                        lg: stats[lg]["chars"] / stats[lg]["tokens"]
+                        for lg in target_langs
+                        if stats[lg]["tokens"] > 0
+                    }
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                lang = rec.get("lang")
+                text = rec.get("text") or ""
+                if lang not in target_langs or stats[lang]["docs"] >= per_lang or not text:
+                    continue
+                ids = tokenizer.encode(text)
+                stats[lang]["chars"] += len(text)
+                stats[lang]["tokens"] += len(ids)
+                stats[lang]["docs"] += 1
+    return {
+        lg: stats[lg]["chars"] / stats[lg]["tokens"]
+        for lg in target_langs
+        if stats[lg]["tokens"] > 0
+    }
+
+
+def estimate_batches_per_epoch(
+    files: List[Path],
+    tokenizer,
+    seq_len: int,
+    batch_size: int,
+    *,
+    chars_per_token: Optional[Dict[str, float]] = None,
+    samples_per_lang: int = 0,
+) -> Tuple[int, float]:
+    """Fast batches/epoch estimate: char scan (+ optional small encode sample).
+
+    Returns ``(batches_per_epoch, estimated_total_tokens)``.
+    """
+    cpt = dict(_CHARS_PER_TOKEN_DEFAULT)
+    if chars_per_token:
+        cpt.update(chars_per_token)
+    if samples_per_lang > 0:
+        t0 = time.time()
+        sampled = sample_chars_per_token(files, tokenizer, samples_per_lang)
+        cpt.update(sampled)
+        print(
+            f"[train]   sample encode {samples_per_lang}/lang in {time.time() - t0:.1f}s  "
+            + "  ".join(f"{lg}={cpt[lg]:.3f} c/t" for lg in sorted(sampled)),
+            flush=True,
+        )
+
+    t0 = time.time()
+    char_stats = scan_jsonl_chars(files)
+    print(f"[train]   char scan {time.time() - t0:.1f}s", flush=True)
+
+    est_tokens = 0.0
+    num_docs = 0
+    for lang, row in char_stats.items():
+        num_docs += row["docs"]
+        ratio = cpt.get(lang)
+        if ratio and row["chars"]:
+            est_tokens += row["chars"] / ratio
+
+    batches = packed_batches_from_stream(
+        int(est_tokens), num_docs, seq_len, batch_size
+    )
+    return batches, est_tokens
 
 
 def count_batches_per_epoch(
@@ -274,6 +428,7 @@ def train_loop(
     print_every: int = 10,
     model_config: Optional[dict] = None,
     ckpt_dir: Optional[Path] = None,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> None:
     """Train for ``epochs`` full passes; optional global cap ``max_steps`` (0 = none)."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +477,7 @@ def train_loop(
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
-                loss = compute_loss(model, x, y)
+                loss = compute_loss(model, x, y, amp_dtype=amp_dtype)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -343,7 +498,7 @@ def train_loop(
 
                 do_eval = step % eval_every == 0
                 if do_eval:
-                    vloss = eval_loss(model, val_batches)
+                    vloss = eval_loss(model, val_batches, amp_dtype=amp_dtype)
                     ppl = math.exp(min(vloss, 50.0))
                     row = {
                         "step": step,
@@ -536,6 +691,12 @@ def _pretrain(args: argparse.Namespace) -> None:
     n_params = sum({id(p): p.numel() for p in model.parameters()}.values())
     print(f"[train] params = {n_params / 1e6:.2f} M", flush=True)
 
+    amp_dtype = resolve_bf16_amp(device, enabled=not args.no_bf16)
+    if amp_dtype is not None:
+        print("[train] mixed precision: bfloat16 autocast", flush=True)
+    else:
+        print("[train] mixed precision: off (fp32)", flush=True)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -557,16 +718,51 @@ def _pretrain(args: argparse.Namespace) -> None:
           f"({args.batch_size}x{args.seq_len} each)", flush=True)
 
     train_files = [Path(f) for f in args.train_files]
-    print("[train] counting batches per epoch (full tokenize pass)...", flush=True)
-    batches_per_epoch = count_batches_per_epoch(
-        train_files, tok, args.seq_len, args.batch_size
-    )
-    tokens_per_epoch = batches_per_epoch * args.batch_size * args.seq_len
-    print(
-        f"[train] {batches_per_epoch:,} batches/epoch  "
-        f"(~{tokens_per_epoch/1e6:.1f}M tokens/epoch)",
-        flush=True,
-    )
+    cpt_override: Dict[str, float] = {}
+    if args.chars_per_tok_zh is not None:
+        cpt_override["zh"] = args.chars_per_tok_zh
+    if args.chars_per_tok_en is not None:
+        cpt_override["en"] = args.chars_per_tok_en
+
+    if args.batches_per_epoch > 0:
+        batches_per_epoch = args.batches_per_epoch
+        est_tokens = batches_per_epoch * args.batch_size * args.seq_len
+        print(
+            f"[train] using --batches-per-epoch {batches_per_epoch:,}  "
+            f"(~{est_tokens/1e6:.1f}M training tokens/epoch, nominal)",
+            flush=True,
+        )
+    elif args.count_batches_exact:
+        print("[train] counting batches/epoch (full tokenize pass)...", flush=True)
+        batches_per_epoch = count_batches_per_epoch(
+            train_files, tok, args.seq_len, args.batch_size
+        )
+        est_tokens = batches_per_epoch * args.batch_size * args.seq_len
+        print(
+            f"[train] {batches_per_epoch:,} batches/epoch (exact)  "
+            f"(~{est_tokens/1e6:.1f}M tokens/epoch, nominal)",
+            flush=True,
+        )
+    else:
+        print("[train] estimating batches/epoch (char scan, no full tokenize)...", flush=True)
+        batches_per_epoch, est_tokens = estimate_batches_per_epoch(
+            train_files,
+            tok,
+            args.seq_len,
+            args.batch_size,
+            chars_per_token=cpt_override or None,
+            samples_per_lang=args.estimate_samples_per_lang,
+        )
+        print(
+            f"[train] ~{batches_per_epoch:,} batches/epoch  "
+            f"(~{est_tokens/1e6:.1f}M tokens in corpus, est.)",
+            flush=True,
+        )
+        print(
+            "[train] progress %% uses this estimate; "
+            "pass --count-batches-exact or --batches-per-epoch to pin it.",
+            flush=True,
+        )
     if args.steps > 0:
         print(f"[train] global step cap: {args.steps:,}", flush=True)
     else:
@@ -606,6 +802,7 @@ def _pretrain(args: argparse.Namespace) -> None:
         print_every=args.print_every,
         model_config=model_config,
         ckpt_dir=ckpt_dir,
+        amp_dtype=amp_dtype,
     )
 
     print(f"[train] done. last.pt / best.pt under {ckpt_dir}", flush=True)
@@ -623,6 +820,35 @@ def main() -> None:
                     default=["data/processed/mix_1to1.jsonl"])
     ap.add_argument("--val-file", default="data/processed/val_set.jsonl")
     ap.add_argument("--tokenizer", default="tokenizer")
+    ap.add_argument(
+        "--batches-per-epoch",
+        type=int,
+        default=0,
+        help="Pin epoch length for progress %% (0 = estimate or exact count).",
+    )
+    ap.add_argument(
+        "--count-batches-exact",
+        action="store_true",
+        help="Full tokenize pass to count batches/epoch (slow; default is estimate).",
+    )
+    ap.add_argument(
+        "--estimate-samples-per-lang",
+        type=int,
+        default=0,
+        help="Docs per language to encode when estimating (0 = default c/t only).",
+    )
+    ap.add_argument(
+        "--chars-per-tok-zh",
+        type=float,
+        default=None,
+        help="Override zh chars/token for batch estimate (default 1.254).",
+    )
+    ap.add_argument(
+        "--chars-per-tok-en",
+        type=float,
+        default=None,
+        help="Override en chars/token for batch estimate (default 3.559).",
+    )
     # Model
     ap.add_argument("--d-model", type=int, default=256)
     ap.add_argument("--n-layer", type=int, default=4)
@@ -632,6 +858,11 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--clip", type=float, default=1.0)
+    ap.add_argument(
+        "--no-bf16",
+        action="store_true",
+        help="Disable bf16 autocast on CUDA (default: bf16 when supported).",
+    )
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument(
         "--epochs",
