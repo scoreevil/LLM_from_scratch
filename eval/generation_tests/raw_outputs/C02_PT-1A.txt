@@ -1,2 +1,0 @@
-[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
-Write a short paragraph about machine learning. I think that I think it's pretty important to start with the basic idea of machine learning, but I think it's pretty important to start with the basic concepts of machine learning in the second part of this article. I think it's good to start with the first part of this article, but I think it's good to start with the second part. In this article I've

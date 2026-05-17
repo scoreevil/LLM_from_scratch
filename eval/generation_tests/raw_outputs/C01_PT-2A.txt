@@ -1,2 +1,0 @@
-[load] resolved config: vocab=8192 d_model=512 n_layer=6 n_heads=8 max_seq_len=512
-The capital of France is the capital of the United States, and the capital of the United States is the capital of the United States, and the capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States, and the capital of the United States is the capital of the United States, and the capital of the United States is the capital of the United States

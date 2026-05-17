@@ -1,5 +1,0 @@
-[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
-Translate to Chinese: The weather is nice today. It’s just that you have to do that.
-This is a time of great concern for Chinese people. The Chinese aren’t just a good place to live. They’re just a good place to live. They’re just a good place to live.
-The Chinese are just a good place to live. They’re just a good place to live. They’re just a good place to live.
-

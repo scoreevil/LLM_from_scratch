@@ -1,1 +1,0 @@
-[error] checkpoint not found: C:\Users\win10\Desktop\程序库\LLM_from_scratch\training\checkpoints\PT-2B\best.pt

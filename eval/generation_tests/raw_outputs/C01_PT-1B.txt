@@ -1,2 +1,0 @@
-[load] resolved config: vocab=8192 d_model=768 n_layer=12 n_heads=12 max_seq_len=512
-The capital of France is the capital of the French Revolution. It is the capital of the French Revolution. It is the capital of the French Revolution. It is the capital of the French Revolution. It is the capital of the French Revolution. It is the capital of the French Revolution. It is the capital of the French Revolution. It is the capital of the French Revolution. It is
