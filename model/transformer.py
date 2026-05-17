@@ -1,8 +1,8 @@
-"""Pre-Norm decoder-only transformer (Phase 4).
+"""Pre-Norm decoder-only transformer (Phase 4 + 6.6).
 
 Assembles the hand-written pieces from earlier phases:
     layers.py       LayerNorm, RotaryEmbedding, init_weights
-    attention.py    CausalMHA  (+ KV-cache)
+    attention.py    CausalMHA  (+ KV-cache, optional Flash kernel)
     ffn.py          FFN
 
 The top-level ``MiniLLM`` is a NanoGPT-shaped decoder LLM with:
@@ -11,6 +11,17 @@ The top-level ``MiniLLM`` is a NanoGPT-shaped decoder LLM with:
     - final LayerNorm
     - lm_head (weight-tied with the token embedding by default)
     - GPT-style init applied at construction time
+
+Phase 6.6 additions (memory savers, both default off → fully backward compat):
+    use_flash_attn       Switch CausalMHA to F.scaled_dot_product_attention
+                         on CUDA. No O(T^2) score tensor. Falls back to the
+                         hand-written kernel when False.
+    use_checkpointing    Wrap each TransformerBlock's forward in
+                         torch.utils.checkpoint.checkpoint, trading ~33% extra
+                         compute for substantially smaller activation memory.
+                         IMPORTANT: only enabled in train mode (auto-disables
+                         when ``self.training`` is False or ``use_cache``
+                         is True), so eval/generation is unaffected.
 
 KV-cache contract (inherited from Phase 3):
     past_key_values: Optional[List[KVCache]]
@@ -28,6 +39,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as cp
 from torch import Tensor
 
 try:
@@ -62,6 +74,7 @@ class TransformerBlock(nn.Module):
         max_seq_len: int = 2048,
         ffn_mult: int = 4,
         bias: bool = True,
+        use_flash_attn: bool = False,
     ) -> None:
         super().__init__()
         self.ln1 = LayerNorm(d_model)
@@ -70,6 +83,7 @@ class TransformerBlock(nn.Module):
             n_heads=n_heads,
             max_seq_len=max_seq_len,
             bias=bias,
+            use_flash_attn=use_flash_attn,
         )
         self.ln2 = LayerNorm(d_model)
         self.ffn = FFN(d_model=d_model, hidden_mult=ffn_mult, bias=bias)
@@ -100,6 +114,8 @@ class MiniLLM(nn.Module):
         ffn_mult: int = 4,
         bias: bool = True,
         tie_weights: bool = True,
+        use_flash_attn: bool = False,
+        use_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -109,6 +125,8 @@ class MiniLLM(nn.Module):
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
         self.tie_weights = tie_weights
+        self.use_flash_attn = use_flash_attn
+        self.use_checkpointing = use_checkpointing
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.ModuleList(
@@ -119,6 +137,7 @@ class MiniLLM(nn.Module):
                     max_seq_len=max_seq_len,
                     ffn_mult=ffn_mult,
                     bias=bias,
+                    use_flash_attn=use_flash_attn,
                 )
                 for _ in range(n_layer)
             ]
@@ -176,10 +195,33 @@ class MiniLLM(nn.Module):
 
         x = self.tok_emb(input_ids)  # [B, T, D]
 
+        # Gradient checkpointing is only meaningful when we're training and
+        # there is no KV cache to grow (cache would be silently discarded
+        # by checkpoint's re-forward pass). Disable in eval / generation.
+        do_ckpt = (
+            self.use_checkpointing
+            and self.training
+            and not use_cache
+            and past_key_values is None
+            and torch.is_grad_enabled()
+        )
+
         new_kvs: List[KVCache] = [] if use_cache else None  # type: ignore[assignment]
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
-            x, new_kv = block(x, past_kv=past_kv, use_cache=use_cache)
+            if do_ckpt:
+                # checkpoint can't easily carry the (out, new_kv) tuple under
+                # non-tensor return types in older torch, but it's safe here:
+                # we only enable it when use_cache=False, so we just need the
+                # tensor out. Wrap in a closure that returns only x.
+                def _run(inp, blk=block):
+                    out, _ = blk(inp, past_kv=None, use_cache=False)
+                    return out
+                # use_reentrant=False is the recommended modern path (PT 2.x).
+                x = cp.checkpoint(_run, x, use_reentrant=False)
+                new_kv = None
+            else:
+                x, new_kv = block(x, past_kv=past_kv, use_cache=use_cache)
             if use_cache:
                 # new_kv is guaranteed non-None here because use_cache=True.
                 new_kvs.append(new_kv)  # type: ignore[arg-type]

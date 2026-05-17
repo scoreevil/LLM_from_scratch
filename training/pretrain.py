@@ -678,6 +678,8 @@ def _pretrain(args: argparse.Namespace) -> None:
 
     print(f"[train] building model: d_model={args.d_model}, n_layer={args.n_layer}, "
           f"n_heads={args.n_heads}, seq_len={args.seq_len}", flush=True)
+    print(f"[train] flash_attn={args.flash_attn}  checkpointing={args.checkpointing}",
+          flush=True)
     model = MiniLLM(
         vocab_size=vocab_size,
         d_model=args.d_model,
@@ -687,6 +689,8 @@ def _pretrain(args: argparse.Namespace) -> None:
         ffn_mult=4,
         bias=True,
         tie_weights=True,
+        use_flash_attn=args.flash_attn,
+        use_checkpointing=args.checkpointing,
     ).to(device)
     n_params = sum({id(p): p.numel() for p in model.parameters()}.values())
     print(f"[train] params = {n_params / 1e6:.2f} M", flush=True)
@@ -785,6 +789,8 @@ def _pretrain(args: argparse.Namespace) -> None:
         "ffn_mult": 4,
         "bias": True,
         "tie_weights": True,
+        "use_flash_attn": args.flash_attn,
+        "use_checkpointing": args.checkpointing,
     }
 
     train_loop(
@@ -854,6 +860,17 @@ def main() -> None:
     ap.add_argument("--n-layer", type=int, default=4)
     ap.add_argument("--n-heads", type=int, default=4)
     ap.add_argument("--seq-len", type=int, default=512)
+    ap.add_argument(
+        "--flash-attn",
+        action="store_true",
+        help="Use F.scaled_dot_product_attention (FlashAttention on CUDA).",
+    )
+    ap.add_argument(
+        "--checkpointing",
+        action="store_true",
+        help="Wrap each block in torch.utils.checkpoint (saves activation memory, "
+             "trades ~33%% compute). Auto-disabled in eval/generation.",
+    )
     # Optim
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=0.1)

@@ -1,4 +1,4 @@
-"""Causal multi-head attention with RoPE and KV-cache (Phase 3).
+"""Causal multi-head attention with RoPE and KV-cache (Phase 3+6.6).
 
 Conventions:
     - Input layout is ``[B, T, D]`` (batch, time, model_dim).
@@ -12,6 +12,12 @@ Conventions:
       single-token decoding step sees the correct phase.
     - The output projection is marked ``_is_residual_proj = True`` so
       ``init_weights(n_layer)`` scales it by ``1/sqrt(2N)``.
+
+Phase 6.6 additions:
+    ``use_flash_attn=True`` switches the attention kernel to PyTorch's
+    ``F.scaled_dot_product_attention`` which on CUDA dispatches to
+    FlashAttention / memory-efficient kernels (no O(T^2) score matrix
+    materialised). Set False to keep the original hand-written O(T^2) path.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 try:
@@ -40,6 +47,7 @@ class CausalMHA(nn.Module):
         max_seq_len: int = 2048,
         rope_base: float = 10000.0,
         bias: bool = True,
+        use_flash_attn: bool = False,
     ) -> None:
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -47,6 +55,7 @@ class CausalMHA(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.max_seq_len = max_seq_len
+        self.use_flash_attn = use_flash_attn
 
         # Fused QKV projection — one linear, split afterwards.
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
@@ -57,10 +66,13 @@ class CausalMHA(nn.Module):
         # RoPE table for q/k.
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=max_seq_len, base=rope_base)
 
-        # Causal mask buffer — lower-triangular bool of shape [L, L].
-        # We slice into this per-call: rows [past_len:past_len+T], cols [:past_len+T].
-        mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool))
-        self.register_buffer("causal_mask", mask, persistent=False)
+        # Causal mask buffer — only needed by the manual path. Skip when flash
+        # is on to save a [L, L] bool buffer per layer at large L.
+        if not use_flash_attn:
+            mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool))
+            self.register_buffer("causal_mask", mask, persistent=False)
+        else:
+            self.causal_mask = None
 
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
@@ -83,7 +95,6 @@ class CausalMHA(nn.Module):
         # --- QKV projection -------------------------------------------------
         qkv = self.qkv(x)                          # [B, T, 3D]
         q, k, v = qkv.split(D, dim=-1)             # each [B, T, D]
-        # Reshape to multi-head layout.
         q = q.view(B, T, H, Hd).transpose(1, 2)    # [B, H, T, Hd]
         k = k.view(B, T, H, Hd).transpose(1, 2)
         v = v.view(B, T, H, Hd).transpose(1, 2)
@@ -101,17 +112,41 @@ class CausalMHA(nn.Module):
 
         new_past_kv: Optional[KVCache] = (k, v) if use_cache else None
 
-        # --- Scaled dot-product attention -----------------------------------
-        # scores: [B, H, T, full_len]
-        scores = (q @ k.transpose(-2, -1)) * self.scale
-
-        # Causal mask: row i (absolute position past_len+i) may attend to
-        # keys at columns 0..past_len+i inclusive.
-        mask = self.causal_mask[past_len:full_len, :full_len]   # [T, full_len]
-        scores = scores.masked_fill(~mask, float("-inf"))
-
-        attn = torch.softmax(scores, dim=-1)
-        out = attn @ v                              # [B, H, T, Hd]
+        # --- Attention ------------------------------------------------------
+        if self.use_flash_attn:
+            # F.scaled_dot_product_attention chooses a memory-efficient kernel
+            # on CUDA (FlashAttention v2 when available). It materialises NO
+            # full [B, H, T, full_len] score tensor.
+            #
+            # Two cases for the causal mask:
+            #   - prefill / no cache (past_len == 0):  is_causal=True works,
+            #     because q and k both start at position 0.
+            #   - decoding step (past_len > 0):        is_causal=True is WRONG
+            #     (it would mask off the past KV that the new q must attend to);
+            #     we pass an explicit additive mask instead. For T=1 (single
+            #     decoding step) the mask is all-zeros (q sees every key).
+            if past_len == 0:
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+                )
+            else:
+                # Build [T, full_len] additive mask: row i (abs pos past_len+i)
+                # may attend to keys at columns 0..past_len+i inclusive.
+                col = torch.arange(full_len, device=q.device)
+                row = torch.arange(past_len, full_len, device=q.device)
+                allowed = col[None, :] <= row[:, None]                   # [T, full_len]
+                attn_mask = torch.zeros_like(allowed, dtype=q.dtype)
+                attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+                )
+        else:
+            # Original hand-written O(T^2) path — kept for ablations / fallback.
+            scores = (q @ k.transpose(-2, -1)) * self.scale
+            mask = self.causal_mask[past_len:full_len, :full_len]   # [T, full_len]
+            scores = scores.masked_fill(~mask, float("-inf"))
+            attn = torch.softmax(scores, dim=-1)
+            out = attn @ v                              # [B, H, T, Hd]
 
         # Merge heads back.
         out = out.transpose(1, 2).contiguous().view(B, T, D)
