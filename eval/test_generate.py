@@ -26,7 +26,7 @@ def main() -> int:
     out_dir = Path(os.getenv("OUT_DIR", str(root / "eval" / "generation_tests")))
     max_new_tokens = int(os.getenv("MAX_NEW_TOKENS", "80"))
     timeout_s = int(os.getenv("TIMEOUT_S", "180"))
-    tokenizer_size = os.getenv("TOKENIZER_SIZE", "32k")
+    tokenizer_size = os.getenv("TOKENIZER_SIZE", "8k")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -124,6 +124,8 @@ def main() -> int:
                 row["output"] = f"[exception] {type(exc).__name__}: {exc}"
 
             group_results[group].append(row)
+            print(case_label, "->", row["output"])
+            print("--------------------------------")
 
     md_name = "results_" + f"{time.strftime('%Y%m%d_%H%M%S')}.md"
     md_path = out_dir / md_name

@@ -6,7 +6,9 @@
       "Bash(python data/download.py --smoke)",
       "Bash(python -c \"import sys,json; [print\\(json.loads\\(l\\)['lang'], len\\(json.loads\\(l\\)['text']\\), 'chars'\\) for l in sys.stdin]\")",
       "Bash(python *)",
-      "WebSearch"
+      "WebSearch",
+      "Read(//c/Users/win10/AppData/Local/Temp/**)",
+      "Bash(rm -rf \"C:/Users/win10/AppData/Local/Temp/tmp_bpe_N\"*_*)"
     ]
   }
 }

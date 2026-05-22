@@ -119,16 +119,16 @@ def main():
     )
     ap.add_argument(
         "--tokenizer-size",
-        default="8k",
+        default="32k",
         help="Tokenizer variant under tokenizer/. e.g. 8k, 32k",
     )
     ap.add_argument("--data-dir", type=Path,
                     default=Path(__file__).resolve().parent.parent / "data" / "processed")
-    ap.add_argument("--samples-per-lang", type=int, default=2000,
+    ap.add_argument("--samples-per-lang", type=int, default=20000,
                     help="Number of docs per language to encode (default 2000).")
     ap.add_argument("--files", nargs="+",
-                    default=["mix_1to1.jsonl", "mix_1to2.jsonl"])
-    ap.add_argument("--heur-total", type=int, default=300_000_000,
+                    default=["mix_1to1_3B.jsonl"])
+    ap.add_argument("--heur-total", type=int, default=3_000_000_000,
                     help="The heuristic token target the Phase-0 script used (default 300M).")
     ap.add_argument("--no-full-scan", action="store_true",
                     help="Skip the full-file char scan (faster, but no file-level projection).")

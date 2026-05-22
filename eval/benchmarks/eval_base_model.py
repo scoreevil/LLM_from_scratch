@@ -25,6 +25,12 @@ Method:
 Multi-checkpoint loop:
     Walks ``--checkpoints-root`` (default ``training/checkpoints``), evaluates
     every ``<group>/best.pt`` it finds, prints a comparison table at the end.
+
+Output:
+    - On-screen per-subject accuracy and cross-lingual PPL.
+    - A Markdown report at
+      ``eval/benchmarks/results_base_<YYYYMMDD_HHMMSS>.md`` with the same
+      breakdown plus a sample of wrong MCQ answers (with per-choice log-probs).
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ import math
 import sys
 import time
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -152,14 +159,22 @@ def evaluate_mcq(
     device: torch.device,
     max_items: Optional[int] = None,
     verbose: bool = True,
+    sample_wrong_keep: int = 5,
 ) -> dict:
     if not jsonl_path.exists():
         print(f"  [skip] {jsonl_path} not found", file=sys.stderr)
-        return {"accuracy": float("nan"), "n": 0, "correct": 0, "by_subject": {}}
+        return {
+            "accuracy": float("nan"),
+            "n": 0,
+            "correct": 0,
+            "by_subject": {},
+            "wrong_samples": [],
+        }
 
     correct = 0
     total = 0
     by_subj: Dict[str, Tuple[int, int]] = {}
+    wrong_samples: List[dict] = []
     t0 = time.time()
 
     with jsonl_path.open("r", encoding="utf-8") as f:
@@ -179,10 +194,20 @@ def evaluate_mcq(
             scores = score_four_choices(model, tok, prefix, choice_texts, device)
             pred = "ABCD"[int(max(range(4), key=lambda j: scores[j]))]
 
+            hit = pred == gold
             c_old, t_old = by_subj.get(subject, (0, 0))
-            by_subj[subject] = (c_old + int(pred == gold), t_old + 1)
-            correct += int(pred == gold)
+            by_subj[subject] = (c_old + int(hit), t_old + 1)
+            correct += int(hit)
             total += 1
+
+            if not hit and len(wrong_samples) < sample_wrong_keep:
+                wrong_samples.append({
+                    "subject": subject,
+                    "question": q,
+                    "gold": gold,
+                    "pred": pred,
+                    "choice_logprobs": {L: scores[j] for j, L in enumerate("ABCD")},
+                })
 
             if verbose and total % 50 == 0:
                 print(f"    ... {total} items, running acc = {correct / total * 100:.2f}% "
@@ -194,6 +219,7 @@ def evaluate_mcq(
         "n": total,
         "correct": correct,
         "by_subject": {s: (c, t, c / max(1, t)) for s, (c, t) in by_subj.items()},
+        "wrong_samples": wrong_samples,
         "elapsed_s": time.time() - t0,
     }
 
@@ -319,6 +345,104 @@ def print_comparison(results: "OrderedDict[str, dict]") -> None:
         )
 
 
+def _md_subject_table(name: str, by_subject: Dict[str, Tuple[int, int, float]]) -> str:
+    lines = [
+        f"### {name} per-subject\n",
+        "| subject | correct | total | acc |",
+        "|---|---:|---:|---:|",
+    ]
+    for subj in sorted(by_subject):
+        c, t, a = by_subject[subj]
+        lines.append(f"| {subj} | {c} | {t} | {a * 100:.2f}% |")
+    return "\n".join(lines) + "\n"
+
+
+def _md_trans_table(trans: dict) -> str:
+    def _row(label: str, ppl_key: str, n_key: str, tok_key: str) -> str:
+        ppl = trans[ppl_key]
+        ppl_s = f"{ppl:.2f}" if ppl == ppl else "NA"
+        return f"| {label} | {ppl_s} | {trans[n_key]} | {trans[tok_key]} |"
+
+    lines = [
+        "### Cross-lingual PPL\n",
+        "| split | PPL | sentences | tokens |",
+        "|---|---:|---:|---:|",
+        _row("zh-only", "ppl_zh", "n_zh", "tok_zh"),
+        _row("en-only", "ppl_en", "n_en", "tok_en"),
+        _row("zh+en paired", "ppl_zh_en", "n_pair", "tok_pair"),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _md_wrong_samples(name: str, samples: List[dict]) -> str:
+    if not samples:
+        return ""
+    lines = [f"### {name} wrong-answer samples\n"]
+    for i, s in enumerate(samples, 1):
+        lp = s["choice_logprobs"]
+        lp_str = ", ".join(f"{L}={lp[L]:.3f}" for L in "ABCD")
+        lines.append(
+            f"**{i}. [{s['subject']}]** gold=`{s['gold']}`  pred=`{s['pred']}`\n\n"
+            f"> Q: {s['question']}\n\n"
+            f"> Choice log-probs (length-normalised): `{lp_str}`\n"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_markdown(
+    out_path: Path,
+    tokenizer_dir: Path,
+    results: "OrderedDict[str, dict]",
+    args: argparse.Namespace,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    sections: List[str] = []
+    sections.append("# Base Model Evaluation\n")
+    sections.append(
+        f"- timestamp: `{ts}`\n"
+        f"- tokenizer dir: `{tokenizer_dir}`\n"
+        f"- max_items: `{args.max_items}`\n"
+        f"- max_seq_len: `{args.max_seq_len}`\n"
+        f"- method: `choice-likelihood` (length-normalised avg log-prob per option, argmax)\n"
+        f"- prompts: `Question: … / Answer:` (en), `问题：… / 答案：` (zh)\n"
+    )
+
+    sections.append("\n## Overall metrics\n")
+    sections.append(
+        "| group | MMLU acc | MMLU correct/total | CMMLU acc | CMMLU correct/total | "
+        "PPL_zh | PPL_en | PPL_zh+en | elapsed |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+    )
+    for name, r in results.items():
+        m = r["mmlu"]
+        c = r["cmmlu"]
+        tr = r["trans"]
+        elapsed = m.get("elapsed_s", 0) + c.get("elapsed_s", 0)
+        ppl_zh = f"{tr['ppl_zh']:.2f}" if tr["ppl_zh"] == tr["ppl_zh"] else "NA"
+        ppl_en = f"{tr['ppl_en']:.2f}" if tr["ppl_en"] == tr["ppl_en"] else "NA"
+        ppl_mix = f"{tr['ppl_zh_en']:.2f}" if tr["ppl_zh_en"] == tr["ppl_zh_en"] else "NA"
+        sections.append(
+            f"| {name} | {m['accuracy'] * 100:.2f}% | {m['correct']}/{m['n']} | "
+            f"{c['accuracy'] * 100:.2f}% | {c['correct']}/{c['n']} | "
+            f"{ppl_zh} | {ppl_en} | {ppl_mix} | {elapsed:.1f}s |"
+        )
+    sections.append("")
+
+    for name, r in results.items():
+        sections.append(f"\n## {name}\n")
+        sections.append(f"- checkpoint: `{r['ckpt_path']}`\n")
+        sections.append(_md_subject_table("MMLU", r["mmlu"]["by_subject"]))
+        sections.append(_md_subject_table("CMMLU", r["cmmlu"]["by_subject"]))
+        sections.append(_md_trans_table(r["trans"]))
+        sections.append(_md_wrong_samples("MMLU", r["mmlu"]["wrong_samples"]))
+        sections.append(_md_wrong_samples("CMMLU", r["cmmlu"]["wrong_samples"]))
+
+    out_path.write_text("\n".join(sections), encoding="utf-8")
+    print(f"\n[report] wrote {out_path}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -346,6 +470,12 @@ def main() -> None:
                     help="Used only when the checkpoint has no config and n_heads can't be inferred.")
     ap.add_argument("--max-seq-len", type=int, default=512)
     ap.add_argument("--device", default=None)
+    ap.add_argument(
+        "--report-dir",
+        type=Path,
+        default=Path("eval/benchmarks"),
+        help="Where the timestamped .md report is written.",
+    )
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -412,7 +542,13 @@ def main() -> None:
         print(f"      zh \\n en  : PPL = {trans['ppl_zh_en']:7.2f}  "
               f"(n={trans['n_pair']}, tokens={trans['tok_pair']})")
 
-        results[name] = {"mmlu": mmlu, "cmmlu": cmmlu, "trans": trans, "config": cfg}
+        results[name] = {
+            "mmlu": mmlu,
+            "cmmlu": cmmlu,
+            "trans": trans,
+            "config": cfg,
+            "ckpt_path": str(path),
+        }
 
         # Release VRAM before loading the next checkpoint.
         del model
@@ -421,6 +557,9 @@ def main() -> None:
 
     if results:
         print_comparison(results)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = args.report_dir / f"results_base_{ts}.md"
+        write_markdown(out_path, tokenizer_dir, results, args)
 
 
 if __name__ == "__main__":

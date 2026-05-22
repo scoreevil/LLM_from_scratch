@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
@@ -87,6 +88,89 @@ def bytes_to_unicode() -> dict[int, str]:
     return {b: chr(c) for b, c in zip(bs, cs)}
 
 
+# ---------------------------------------------------------------------------
+# Multiprocessing workers (must be top-level for Windows `spawn` picklability).
+# ---------------------------------------------------------------------------
+
+# 当 `affected` 比这个小，并行分发的 IPC 成本超过节省的计算量,直接走单进程路径。
+# 早期 merge 一次性 affected 上万,后期降到几十,该阈值兼顾两端。
+APPLY_PARALLEL_THRESHOLD = 256
+
+# Pre-tokenization 分块大小:每个 worker 一次处理这么多 doc,平摊 IPC 与启动成本。
+PRETOK_CHUNK_SIZE = 256
+
+
+def _pretok_chunk(args):
+    """Worker:对一批文本应用预分词正则,返回片段->计数的局部 Counter。
+
+    Counter 加法可交换可结合,主进程聚合时与单进程结果完全一致。
+    """
+    pattern_src, texts = args
+    pat = re.compile(pattern_src)
+    c: Counter = Counter()
+    for t in texts:
+        if t:
+            c.update(pat.findall(t))
+    return c
+
+
+def _apply_merge_chunk(args):
+    """Worker:把单次 merge 应用到一批 `affected` 词上,返回五元组 delta。
+
+    Args:
+        best:          被合并的二元组 (a, b)
+        new_token:     a + b 的字符串拼接
+        chunk_words:   该 worker 负责的词元组列表(`words` dict 的一部分 key)
+        chunk_freqs:   {word: freq} dict,仅 chunk_words 子集
+
+    Returns:
+        freq_deltas:  dict[pair, int]    某二元组频次的净变化(可正可负)
+        add_pw:       dict[pair, list]   某二元组 *新增* 到哪些(新)词中
+        rem_pw:       dict[pair, list]   某二元组 *移除* 自哪些(旧)词中
+        new_words:    dict[tuple, int]   该 chunk 产生的新词及其频次
+        removed:      list[tuple]        该 chunk 处理的旧词(主进程统一从全局删)
+
+    决定论保证:整数加减可交换;集合 add/discard 幂等;
+    主进程按 chunk_id 升序应用 → 与单进程顺序处理 word 等价。
+    """
+    best, new_token, chunk_words, chunk_freqs = args
+    a, b = best
+    freq_deltas: defaultdict = defaultdict(int)
+    add_pw: defaultdict = defaultdict(list)
+    rem_pw: defaultdict = defaultdict(list)
+    new_words: defaultdict = defaultdict(int)
+    removed: list = []
+    for old_word in chunk_words:
+        freq = chunk_freqs[old_word]
+        removed.append(old_word)
+        # 从所有「非本次合并对」的统计中扣除该旧词元组的贡献。
+        for i in range(len(old_word) - 1):
+            p = (old_word[i], old_word[i + 1])
+            if p == best:
+                continue
+            freq_deltas[p] -= freq
+            rem_pw[p].append(old_word)
+        # 在原词元组上就地应用合并:连续 best 合并为 new_token。
+        new_word_list = []
+        i = 0
+        last = len(old_word) - 1
+        while i < len(old_word):
+            if i < last and old_word[i] == a and old_word[i + 1] == b:
+                new_word_list.append(new_token)
+                i += 2
+            else:
+                new_word_list.append(old_word[i])
+                i += 1
+        new_word = tuple(new_word_list)
+        new_words[new_word] += freq
+        # 新词元组产生的相邻对,把频次加回统计与倒排索引。
+        for i in range(len(new_word) - 1):
+            p = (new_word[i], new_word[i + 1])
+            freq_deltas[p] += freq
+            add_pw[p].append(new_word)
+    return freq_deltas, add_pw, rem_pw, new_words, removed
+
+
 class BBPETokenizer:
     """Byte-Level BPE 分词器：训练时学 merges 与扩展词表；编码时对每个预分词片段做 BPE 切分。"""
 
@@ -117,151 +201,245 @@ class BBPETokenizer:
         vocab_size: int,
         verbose: bool = True,
         log_every: int = 500,
+        num_workers: int = 0,
     ) -> None:
-        """在语料上统计片段与相邻对，迭代合并直到词表达到 ``vocab_size``。"""
+        """在语料上统计片段与相邻对,迭代合并直到词表达到 ``vocab_size``。
+
+        ``num_workers``:
+            0 (默认,推荐) -> 单进程,行为与历史版本逐字节一致。
+            >=2          -> 多进程并行预分词 + merge-apply 内层。决定论保证产物
+                            与单进程逐字节一致(按 chunk_id 升序合并 delta,
+                            整数运算可交换,集合操作幂等)。
+
+        ⚠️ 性能现实(Windows):
+            spawn 模式下每次 pool.map 都要 pickle 大量 tuple[str] word 对象,
+            实测 IPC 成本与计算时间相当甚至更大。num_workers=8 在 Windows 上
+            常常**比单进程更慢**。本路径主要价值是 Linux fork 模型(子进程
+            COW 共享父内存,IPC 几乎免费),那里能拿到 ~2x 加速。
+            **Windows 用户请保持 num_workers=0。**
+        """
         assert vocab_size >= 256, "vocab_size must be >= 256 (byte-level base)"
         self._init_byte_vocab()
 
-        t0 = time.time()
-        piece_counts: defaultdict[str, int] = defaultdict(int)
-        n_docs = 0
-        pbar = tqdm(
-            iterator,
-            desc="pre-tok",
-            unit="doc",
-            disable=not verbose,
-            mininterval=0.5,
-            dynamic_ncols=True,
-        )
-        for text in pbar:
-            if not text:
-                continue
-            for piece in self.pat.findall(text):
-                piece_counts[piece] += 1
-            n_docs += 1
-            if n_docs % 2000 == 0:
-                pbar.set_postfix(pieces=len(piece_counts), refresh=False)
-        pbar.close()
-        if verbose:
-            print(
-                f"  [pre-tok] done: {n_docs} docs -> {len(piece_counts)} unique pieces "
-                f"({time.time() - t0:.1f}s)",
-                flush=True,
-            )
+        pool = None
+        if num_workers and num_workers >= 2:
+            pool = mp.Pool(num_workers)
+            if verbose:
+                print(f"  [pool] using {num_workers} workers", flush=True)
 
-        # 每个预分词片段转为「字节经 b2u 后的字符元组」；相同元组合并频次。
-        words: dict[tuple, int] = {}
-        for piece, count in piece_counts.items():
-            if not piece:
-                continue
-            tup = tuple(self.b2u[b] for b in piece.encode("utf-8"))
-            if tup:
-                words[tup] = words.get(tup, 0) + count
-        del piece_counts
+        try:
+            t0 = time.time()
+            piece_counts: defaultdict[str, int] = defaultdict(int)
+            n_docs = 0
 
-        # 初始：所有相邻对的频次表 + 倒排索引（某对出现在哪些「词元组」里）。
-        pair_freqs: defaultdict[tuple, int] = defaultdict(int)
-        pair_words: defaultdict[tuple, set] = defaultdict(set)
-        for word, freq in words.items():
-            for i in range(len(word) - 1):
-                p = (word[i], word[i + 1])
-                pair_freqs[p] += freq
-                pair_words[p].add(word)
-
-        merges: list[tuple[str, str]] = []
-        num_merges = vocab_size - 256
-        if verbose:
-            print(
-                f"  [bpe] target merges = {num_merges}  "
-                f"(initial pairs = {len(pair_freqs)}, unique words = {len(words)})",
-                flush=True,
-            )
-
-        t1 = time.time()
-        merge_bar = tqdm(
-            total=num_merges,
-            desc="bpe-merge",
-            unit="merge",
-            disable=not verbose,
-            mininterval=0.5,
-            dynamic_ncols=True,
-        )
-        for step in range(num_merges):
-            if not pair_freqs:
-                break
-            # 确定性：频次最高者优先；平局则按二元组字典序打破。
-            best = max(pair_freqs, key=lambda p: (pair_freqs[p], p))
-            best_freq = pair_freqs[best]
-            if best_freq <= 0:
-                break
-
-            new_token = best[0] + best[1]
-            merges.append(best)
-            if new_token not in self.encoder:
-                new_id = len(self.encoder)
-                self.encoder[new_token] = new_id
-                self.decoder[new_id] = new_token
-
-            affected = list(pair_words[best])
-            del pair_freqs[best]
-            del pair_words[best]
-
-            for old_word in affected:
-                if old_word not in words:
-                    continue
-                freq = words.pop(old_word)
-                # 从所有「非本次合并对」的统计中扣除该旧词元组的贡献。
-                for i in range(len(old_word) - 1):
-                    p = (old_word[i], old_word[i + 1])
-                    if p == best:
-                        continue
-                    pair_freqs[p] -= freq
-                    if pair_freqs[p] <= 0:
-                        pair_freqs.pop(p, None)
-                    s = pair_words.get(p)
-                    if s is not None:
-                        s.discard(old_word)
-                        if not s:
-                            pair_words.pop(p, None)
-                # 在原词元组上就地应用合并：连续 best 合并为 new_token。
-                new_word_list = []
-                i = 0
-                last = len(old_word) - 1
-                while i < len(old_word):
-                    if i < last and old_word[i] == best[0] and old_word[i + 1] == best[1]:
-                        new_word_list.append(new_token)
-                        i += 2
-                    else:
-                        new_word_list.append(old_word[i])
-                        i += 1
-                new_word = tuple(new_word_list)
-                words[new_word] = words.get(new_word, 0) + freq
-                # 新词元组产生的相邻对，把频次加回统计与倒排索引。
-                for i in range(len(new_word) - 1):
-                    p = (new_word[i], new_word[i + 1])
-                    pair_freqs[p] += freq
-                    pair_words[p].add(new_word)
-
-            merge_bar.update(1)
-            if (step + 1) % log_every == 0:
-                preview = new_token if len(new_token) <= 12 else new_token[:12] + "..."
-                # ascii() 强制 \uXXXX 转义，保证进度条后缀在任意控制台都安全。
-                merge_bar.set_postfix(
-                    freq=best_freq,
-                    vocab=len(self.encoder),
-                    pairs=len(pair_freqs),
-                    last=ascii(preview),
-                    refresh=False,
+            if pool is None:
+                # 单进程预分词 (原路径)。
+                pbar = tqdm(
+                    iterator,
+                    desc="pre-tok",
+                    unit="doc",
+                    disable=not verbose,
+                    mininterval=0.5,
+                    dynamic_ncols=True,
                 )
-        merge_bar.close()
+                for text in pbar:
+                    if not text:
+                        continue
+                    for piece in self.pat.findall(text):
+                        piece_counts[piece] += 1
+                    n_docs += 1
+                    if n_docs % 2000 == 0:
+                        pbar.set_postfix(pieces=len(piece_counts), refresh=False)
+                pbar.close()
+            else:
+                # 多进程预分词:按 PRETOK_CHUNK_SIZE 切批,workers 返回 Counter,
+                # 主进程累加。Counter 加法可交换可结合,结果与单进程一致。
+                def _chunked():
+                    buf: list = []
+                    for text in iterator:
+                        if not text:
+                            continue
+                        buf.append(text)
+                        if len(buf) >= PRETOK_CHUNK_SIZE:
+                            yield (GPT4_PATTERN, buf)
+                            buf = []
+                    if buf:
+                        yield (GPT4_PATTERN, buf)
 
-        self.bpe_ranks = {pair: i for i, pair in enumerate(merges)}
-        if verbose:
-            print(
-                f"  [bpe] done. final vocab_size={len(self.encoder)}  "
-                f"merges={len(merges)}  total {time.time() - t0:.1f}s",
-                flush=True,
+                pbar = tqdm(
+                    desc="pre-tok",
+                    unit="chunk",
+                    disable=not verbose,
+                    mininterval=0.5,
+                    dynamic_ncols=True,
+                )
+                # imap_unordered 拿回每个 chunk 的局部 Counter; 顺序无关。
+                for partial in pool.imap_unordered(_pretok_chunk, _chunked(),
+                                                   chunksize=1):
+                    for piece, c in partial.items():
+                        piece_counts[piece] += c
+                    n_docs += PRETOK_CHUNK_SIZE  # 近似;最后一批可能更少
+                    pbar.update(1)
+                    if pbar.n % 20 == 0:
+                        pbar.set_postfix(pieces=len(piece_counts), refresh=False)
+                pbar.close()
+
+            if verbose:
+                print(
+                    f"  [pre-tok] done: ~{n_docs} docs -> {len(piece_counts)} unique pieces "
+                    f"({time.time() - t0:.1f}s)",
+                    flush=True,
+                )
+
+            # 每个预分词片段转为「字节经 b2u 后的字符元组」;相同元组合并频次。
+            words: dict[tuple, int] = {}
+            for piece, count in piece_counts.items():
+                if not piece:
+                    continue
+                tup = tuple(self.b2u[b] for b in piece.encode("utf-8"))
+                if tup:
+                    words[tup] = words.get(tup, 0) + count
+            del piece_counts
+
+            # 初始:所有相邻对的频次表 + 倒排索引(某对出现在哪些「词元组」里)。
+            pair_freqs: defaultdict[tuple, int] = defaultdict(int)
+            pair_words: defaultdict[tuple, set] = defaultdict(set)
+            for word, freq in words.items():
+                for i in range(len(word) - 1):
+                    p = (word[i], word[i + 1])
+                    pair_freqs[p] += freq
+                    pair_words[p].add(word)
+
+            merges: list[tuple[str, str]] = []
+            num_merges = vocab_size - 256
+            if verbose:
+                print(
+                    f"  [bpe] target merges = {num_merges}  "
+                    f"(initial pairs = {len(pair_freqs)}, unique words = {len(words)})",
+                    flush=True,
+                )
+
+            t1 = time.time()
+            merge_bar = tqdm(
+                total=num_merges,
+                desc="bpe-merge",
+                unit="merge",
+                disable=not verbose,
+                mininterval=0.5,
+                dynamic_ncols=True,
             )
+            for step in range(num_merges):
+                if not pair_freqs:
+                    break
+                # 确定性:频次最高者优先;平局则按二元组字典序打破。
+                best = max(pair_freqs, key=lambda p: (pair_freqs[p], p))
+                best_freq = pair_freqs[best]
+                if best_freq <= 0:
+                    break
+
+                new_token = best[0] + best[1]
+                merges.append(best)
+                if new_token not in self.encoder:
+                    new_id = len(self.encoder)
+                    self.encoder[new_token] = new_id
+                    self.decoder[new_id] = new_token
+
+                affected = list(pair_words[best])
+                del pair_freqs[best]
+                del pair_words[best]
+
+                if pool is not None and len(affected) >= APPLY_PARALLEL_THRESHOLD:
+                    # ---- 并行 apply 路径 ----
+                    # 按 stride 切块(决定论:不按 hash 不按内容,可重现)。
+                    # workers 返回 delta dict; 主进程按 chunk_id 升序合并入全局。
+                    N = num_workers
+                    chunks = [affected[i::N] for i in range(N)]
+                    chunks = [c for c in chunks if c]  # 跳过空 chunk
+                    args_list = [
+                        (best, new_token, c, {w: words[w] for w in c})
+                        for c in chunks
+                    ]
+                    results = pool.map(_apply_merge_chunk, args_list)
+
+                    for freq_deltas, add_pw, rem_pw, new_words_dict, removed in results:
+                        for w in removed:
+                            words.pop(w, None)
+                        for p, d in freq_deltas.items():
+                            pair_freqs[p] += d
+                            if pair_freqs[p] <= 0:
+                                pair_freqs.pop(p, None)
+                        for p, ws in rem_pw.items():
+                            s = pair_words.get(p)
+                            if s is not None:
+                                s.difference_update(ws)
+                                if not s:
+                                    pair_words.pop(p, None)
+                        for w, f in new_words_dict.items():
+                            words[w] = words.get(w, 0) + f
+                        for p, ws in add_pw.items():
+                            pair_words[p].update(ws)
+                else:
+                    # ---- 单进程 apply 路径(原代码,不动)----
+                    for old_word in affected:
+                        if old_word not in words:
+                            continue
+                        freq = words.pop(old_word)
+                        # 从所有「非本次合并对」的统计中扣除该旧词元组的贡献。
+                        for i in range(len(old_word) - 1):
+                            p = (old_word[i], old_word[i + 1])
+                            if p == best:
+                                continue
+                            pair_freqs[p] -= freq
+                            if pair_freqs[p] <= 0:
+                                pair_freqs.pop(p, None)
+                            s = pair_words.get(p)
+                            if s is not None:
+                                s.discard(old_word)
+                                if not s:
+                                    pair_words.pop(p, None)
+                        # 在原词元组上就地应用合并:连续 best 合并为 new_token。
+                        new_word_list = []
+                        i = 0
+                        last = len(old_word) - 1
+                        while i < len(old_word):
+                            if i < last and old_word[i] == best[0] and old_word[i + 1] == best[1]:
+                                new_word_list.append(new_token)
+                                i += 2
+                            else:
+                                new_word_list.append(old_word[i])
+                                i += 1
+                        new_word = tuple(new_word_list)
+                        words[new_word] = words.get(new_word, 0) + freq
+                        # 新词元组产生的相邻对,把频次加回统计与倒排索引。
+                        for i in range(len(new_word) - 1):
+                            p = (new_word[i], new_word[i + 1])
+                            pair_freqs[p] += freq
+                            pair_words[p].add(new_word)
+
+                merge_bar.update(1)
+                if (step + 1) % log_every == 0:
+                    preview = new_token if len(new_token) <= 12 else new_token[:12] + "..."
+                    # ascii() 强制 \uXXXX 转义,保证进度条后缀在任意控制台都安全。
+                    merge_bar.set_postfix(
+                        freq=best_freq,
+                        vocab=len(self.encoder),
+                        pairs=len(pair_freqs),
+                        last=ascii(preview),
+                        refresh=False,
+                    )
+            merge_bar.close()
+
+            self.bpe_ranks = {pair: i for i, pair in enumerate(merges)}
+            if verbose:
+                print(
+                    f"  [bpe] done. final vocab_size={len(self.encoder)}  "
+                    f"merges={len(merges)}  total {time.time() - t0:.1f}s",
+                    flush=True,
+                )
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
     # ----------------------------------------------------------------- encode
     def _bpe(self, piece_unicode: str) -> list[str]:
@@ -412,7 +590,7 @@ def main() -> None:
     ap.add_argument(
         "--data",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "data" / "processed" / "mix_1to1.jsonl",
+        default=Path(__file__).resolve().parent.parent / "data" / "processed" / "mix_1to1_3B.jsonl",
     )
     ap.add_argument("--vocab-size", type=int, default=8192)
     ap.add_argument("--max-samples", type=int, default=50_000)
@@ -427,6 +605,16 @@ def main() -> None:
         default=None,
         help="Output directory. If omitted, uses tokenizer/<--tokenizer-size>.",
     )
+    ap.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="CPU worker processes for pre-tok + merge-apply inner loop. "
+             "0 (default, recommended on Windows) = sequential, byte-identical to "
+             "historical behavior. >=2 enables multiprocessing but is typically "
+             "SLOWER on Windows due to spawn-mode pickle overhead; useful mainly "
+             "on Linux fork() platforms. Output is byte-identical across N.",
+    )
     args = ap.parse_args()
     out_dir = args.out_dir or (Path(__file__).resolve().parent / args.tokenizer_size)
 
@@ -436,11 +624,15 @@ def main() -> None:
             sys.exit(1)
         print(
             f"[train] vocab_size={args.vocab_size}  max_samples={args.max_samples}  "
-            f"data={args.data}",
+            f"data={args.data}  num_workers={args.num_workers}",
             flush=True,
         )
         tok = BBPETokenizer()
-        tok.train(_iter_jsonl(args.data, args.max_samples), vocab_size=args.vocab_size)
+        tok.train(
+            _iter_jsonl(args.data, args.max_samples),
+            vocab_size=args.vocab_size,
+            num_workers=args.num_workers,
+        )
         tok.save(out_dir)
         print(f"[train] saved vocab.json + merges.txt -> {out_dir}")
         # 对落盘文件再加载一次，做短句编解码自检。
